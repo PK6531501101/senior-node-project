@@ -1,3 +1,4 @@
+// ==== Imports ====
 const express = require('express');
 const mongoose = require('mongoose');
 const bcrypt = require('bcrypt');
@@ -7,36 +8,33 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 
+// ==== Config ====
 const app = express();
 const PORT = 3000;
 const SECRET = "mysecretkey";
+const uploadDir = path.join(__dirname, 'uploads/complaints');
 
+// ==== Middleware ====
 app.use(cors());
 app.use(express.json());
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
-// MongoDB connection
+// ==== MongoDB ====
 mongoose.connect('mongodb://127.0.0.1:27017/VOC')
     .then(() => console.log("MongoDB connected"))
     .catch(console.log);
 
-// Upload setup
-const uploadDir = path.join(__dirname, 'uploads/complaints');
+// ==== File Upload ====
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
-
 const storage = multer.diskStorage({
-    destination: (req, file, cb) => {
-        cb(null, uploadDir);
-    },
-    filename: (req, file, cb) => {
-        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-        cb(null, uniqueSuffix + path.extname(file.originalname));
-    }
+    destination: (_, __, cb) => cb(null, uploadDir),
+    filename: (_, file, cb) => cb(null, Date.now() + '-' + Math.round(Math.random() * 1e9) + path.extname(file.originalname))
 });
 const upload = multer({ storage });
 
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
-// User schema
+// ==== Models ====
 const userSchema = new mongoose.Schema({
     username: { type: String, required: true, unique: true },
     name: { type: String, required: true },
@@ -47,6 +45,22 @@ const userSchema = new mongoose.Schema({
     division: { type: String, default: "General Public" }
 });
 const User = mongoose.model('User', userSchema);
+
+// ==== Auth Middleware ====
+const authenticateToken = (req, res, next) => {
+    const token = req.headers['authorization']?.split(' ')[1];
+    if (!token) return res.status(401).json({ error: 'No token provided' });
+
+    jwt.verify(token, SECRET, (err, user) =>
+        err ? res.status(403).json({ error: 'Invalid token' }) : (req.user = user, next())
+    );
+};
+const checkRole = (req, res, next) => {
+    if (![2, 3].includes(req.user.role)) return res.status(403).json({ error: 'Access denied' });
+    next();
+};
+
+// ==== Routes ====
 
 // Register
 app.post('/register', async (req, res) => {
@@ -70,16 +84,17 @@ app.post('/login', async (req, res) => {
     if (!user) return res.status(400).json({ error: "User not found" });
     if (!await bcrypt.compare(password, user.password)) return res.status(400).json({ error: "Invalid password" });
 
-    const token = jwt.sign({ id: user._id, username, email: user.email, role: user.role, division: user.division }, SECRET, { expiresIn: '1h' });
-    res.json({ message: "Login successful", token, user: { id: user._id, username, name: user.name, email: user.email, phone: user.phone, role: user.role, division: user.division } });
-});
+    const token = jwt.sign(
+        { id: user._id, username, email: user.email, role: user.role, division: user.division },
+        SECRET, { expiresIn: '1h' }
+    );
 
-// Auth middleware
-const authenticateToken = (req, res, next) => {
-    const token = req.headers['authorization']?.split(' ')[1];
-    if (!token) return res.status(401).json({ error: 'No token provided' });
-    jwt.verify(token, SECRET, (err, user) => err ? res.status(403).json({ error: 'Invalid token' }) : (req.user = user, next()));
-};
+    res.json({
+        message: "Login successful",
+        token,
+        user: { id: user._id, username, name: user.name, email: user.email, phone: user.phone, role: user.role, division: user.division }
+    });
+});
 
 // Profile
 app.get('/profile', authenticateToken, async (req, res) => {
@@ -87,21 +102,33 @@ app.get('/profile', authenticateToken, async (req, res) => {
     user ? res.json(user) : res.status(404).json({ error: 'User not found' });
 });
 
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
-
-// Middleware: check role (2=Staff, 3=Staff(Only Legal))
-const checkRole = (req, res, next) => {
-    if (![2, 3].includes(req.user.role)) return res.status(403).json({ error: 'Access denied' });
-    next();
-};
-
-// Show Tracking
+// My Reports 
 app.get('/myreports', authenticateToken, async (req, res) => {
     try {
         const email = req.user.email;
+        const complaints = await Complaint.find({ email });
+        const corruptions = await Corruption.find({ email });
 
-        const complaints = await Complaint.find({ email }).select('title status acceptInfo date');
-        const corruptions = await Corruption.find({ email }).select('reportedName status acceptInfo dateSubmitted');
+        // update view ถ้ามี message/predict ใหม่
+        for (let c of complaints) {
+            if ((c.acceptInfo?.message && c.acceptInfo.message.trim() !== '') ||
+                (c.acceptInfo?.predict && c.acceptInfo.predict.trim() !== '')) {
+                if (c.view !== 'Not read yet') {
+                    c.view = 'Not read yet';
+                    await c.save();
+                }
+            }
+        }
+
+        for (let c of corruptions) {
+            if ((c.acceptInfo?.message && c.acceptInfo.message.trim() !== '') ||
+                (c.acceptInfo?.predict && c.acceptInfo.predict.trim() !== '')) {
+                if (c.view !== 'Not read yet') {
+                    c.view = 'Not read yet';
+                    await c.save();
+                }
+            }
+        }
 
         const reports = [
             ...complaints.map(c => ({
@@ -110,7 +137,8 @@ app.get('/myreports', authenticateToken, async (req, res) => {
                 title: c.title,
                 status: c.status,
                 acceptInfo: c.acceptInfo,
-                date: c.date
+                date: c.date,
+                view: c.view
             })),
             ...corruptions.map(c => ({
                 _id: c._id,
@@ -118,42 +146,79 @@ app.get('/myreports', authenticateToken, async (req, res) => {
                 title: c.reportedName,
                 status: c.status,
                 acceptInfo: c.acceptInfo,
-                date: c.dateSubmitted
+                date: c.dateSubmitted,
+                view: c.view
             }))
         ].sort((a, b) => new Date(b.date) - new Date(a.date));
 
         res.json(reports);
-    } catch {
+    } catch (err) {
+        console.error(err);
         res.status(500).json({ error: 'Failed to fetch reports' });
     }
 });
+
+// PATCH: update view field for user
+app.patch('/report/:type/:id/view', authenticateToken, async (req, res) => {
+    try {
+        const { type, id } = req.params;
+        const email = req.user.email;
+        let model = type === 'Complaint' ? Complaint : Corruption;
+
+        const report = await model.findOne({ _id: id, email });
+        if (!report) return res.status(404).json({ error: 'Report not found' });
+
+        // update view -> Read
+        if (report.view === 'Not read yet') {
+            report.view = 'Read';
+            await report.save();
+        }
+
+        res.json({ message: `${type} marked as viewed`, report });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Failed to update report view' });
+    }
+});
+
+// new API for getting unread notifications count for Role 1
+app.get('/api/unread-count', authenticateToken, async (req, res) => {
+    try {
+        if (req.user.role !== 1) { // Check if the user's role is not 1
+            return res.status(403).json({ error: 'Access denied.' });
+        }
+
+        const email = req.user.email;
+
+        const unreadComplaintCount = await Complaint.countDocuments({ email: email, view: 'Not read yet' });
+        const unreadCorruptionCount = await Corruption.countDocuments({ email: email, view: 'Not read yet' });
+
+        const unreadCount = unreadComplaintCount + unreadCorruptionCount;
+
+        res.json({ unreadCount });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Failed to fetch unread count' });
+    }
+});
+
+// Unread Counts
 app.get('/unread-counts', authenticateToken, async (req, res) => {
     try {
-        let suggestionCount = 0;
-        let complaintCount = 0;
-        let corruptionCount = 0;
+        let [suggestionCount, complaintCount, corruptionCount] = [0, 0, 0];
 
         // Suggestion
         if ([2, 3].includes(req.user.role)) {
-            suggestionCount = await Suggestion.countDocuments({
-                division: req.user.division,
-                status: 'Not read yet'
-            });
+            suggestionCount = await Suggestion.countDocuments({ division: req.user.division, status: 'Not read yet' });
         }
 
         // Complaint
         if (req.user.role === 3 || req.user.division === "Correspondence, Document, and Legal Affairs Division") {
-            // Role 3 เห็นทุก complaint
             complaintCount = await Complaint.countDocuments({ status: 'Not read yet' });
         } else if (req.user.role === 2) {
-            // Role 2: นับเฉพาะ complaint ที่มี forwardHistory และ toDivision ตรงกับ division ของ user
             const complaints = await Complaint.find({ forwardHistory: { $exists: true, $ne: [] } });
-
             complaintCount = complaints.filter(c =>
-                c.forwardHistory.some(f =>
-                    f.toDivision === req.user.division &&
-                    f.forwardStatus === 'Not read yet'
-                )
+                c.forwardHistory.some(f => f.toDivision === req.user.division && f.forwardStatus === 'Not read yet')
             ).length;
         }
 
@@ -162,11 +227,7 @@ app.get('/unread-counts', authenticateToken, async (req, res) => {
             corruptionCount = await Corruption.countDocuments({ status: 'Not read yet' });
         }
 
-        res.json({
-            suggestion: suggestionCount,
-            complaint: complaintCount,
-            corruption: corruptionCount
-        });
+        res.json({ suggestion: suggestionCount, complaint: complaintCount, corruption: corruptionCount });
     } catch (err) {
         console.error(err);
         res.status(500).json({ error: 'Failed to fetch counts' });
@@ -258,6 +319,23 @@ app.patch('/suggestion/:id/status', authenticateToken, checkRole, async (req, re
     res.json({ message: 'Status updated', suggestion });
 });
 
+// Update suggestion status to "Accept"
+app.patch('/suggestion/:id/status', authenticateToken, checkRole, async (req, res) => {
+    try {
+        const suggestion = await Suggestion.findById(req.params.id);
+        if (!suggestion) return res.status(404).json({ error: 'Suggestion not found' });
+        if (suggestion.division !== req.user.division) return res.status(403).json({ error: 'Access denied for this division' });
+
+        suggestion.status = 'Accept';
+        await suggestion.save();
+
+        res.json({ message: 'Status updated to Accept', suggestion });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Failed to update status' });
+    }
+});
+
 // Update suggestion status to "On process"
 app.patch('/suggestion/:id/view', authenticateToken, checkRole, async (req, res) => {
     try {
@@ -271,23 +349,6 @@ app.patch('/suggestion/:id/view', authenticateToken, checkRole, async (req, res)
         }
 
         res.json({ message: 'Status updated to On process', suggestion });
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: 'Failed to update status' });
-    }
-});
-
-// Update suggestion status to "Accept"
-app.patch('/suggestion/:id/status', authenticateToken, checkRole, async (req, res) => {
-    try {
-        const suggestion = await Suggestion.findById(req.params.id);
-        if (!suggestion) return res.status(404).json({ error: 'Suggestion not found' });
-        if (suggestion.division !== req.user.division) return res.status(403).json({ error: 'Access denied for this division' });
-
-        suggestion.status = 'Accept';
-        await suggestion.save();
-
-        res.json({ message: 'Status updated to Accept', suggestion });
     } catch (err) {
         console.error(err);
         res.status(500).json({ error: 'Failed to update status' });
@@ -309,6 +370,7 @@ const complaintSchema = new mongoose.Schema({
     title: String,
     details: { type: String, required: true },
     status: { type: String, default: "Not read yet" },
+    view: { type: String, default: "Not read yet" },
     file: String,
     forwardHistory: [
         {
@@ -610,6 +672,7 @@ const corruptionSchema = new mongoose.Schema({
 
     dateSubmitted: { type: Date, default: Date.now },
     status: { type: String, default: "Not read yet" },
+    view: { type: String, default: "Not read yet" },
     expectedFinishDate: Date,
     send: { type: String, default: "Correspondence, Document, and Legal Affairs Division" }
 });
@@ -971,3 +1034,5 @@ app.get('/dashboard/legal', authenticateToken, async (req, res) => {
         res.status(500).json({ error: "Failed to fetch dashboard data" });
     }
 });
+
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
