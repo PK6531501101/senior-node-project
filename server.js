@@ -735,7 +735,7 @@ app.post('/corruption/accept/:id', authenticateToken, async (req, res) => {
     }
 
     corruption.acceptInfo = { predict, acceptedBy, message, acceptedDate: new Date(), finished: false };
-    corruption.status = 'In Progress';
+    corruption.status = 'On process';
 
     await corruption.save();
     res.json({ message: 'Accept info saved' });
